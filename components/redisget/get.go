@@ -71,19 +71,19 @@ func (c *Component) OnSettings(_ context.Context, msg any) error {
 }
 
 // Handle dispatches the RequestPort. System ports go through capabilities.
-func (c *Component) Handle(ctx context.Context, handler module.Handler, port string, msg any) any {
+func (c *Component) Handle(ctx context.Context, handler module.Handler, port string, msg any) module.Result {
 	if port != RequestPort {
-		return fmt.Errorf("unknown port: %s", port)
+		return module.Fail(fmt.Errorf("unknown port: %s", port))
 	}
 
 	in, ok := msg.(Request)
 	if !ok {
-		return fmt.Errorf("invalid request")
+		return module.Fail(fmt.Errorf("invalid request"))
 	}
 	return c.get(ctx, handler, in)
 }
 
-func (c *Component) get(ctx context.Context, handler module.Handler, in Request) any {
+func (c *Component) get(ctx context.Context, handler module.Handler, in Request) module.Result {
 	client, err := pool.Redis(in.URL)
 	if err != nil {
 		return c.fail(ctx, handler, in.Context, err)
@@ -99,9 +99,9 @@ func (c *Component) get(ctx context.Context, handler module.Handler, in Request)
 	return handler(ctx, ResponsePort, Response{Context: in.Context, Found: true, Value: val})
 }
 
-func (c *Component) fail(ctx context.Context, handler module.Handler, reqCtx Context, err error) any {
+func (c *Component) fail(ctx context.Context, handler module.Handler, reqCtx Context, err error) module.Result {
 	if !c.settings.EnableErrorPort {
-		return err
+		return module.Fail(err)
 	}
 	return handler(ctx, ErrorPort, Error{Context: reqCtx, Error: err.Error()})
 }
