@@ -15,6 +15,8 @@ import (
 	_ "github.com/tiny-systems/database-module/components/redisdedup"
 	_ "github.com/tiny-systems/database-module/components/redisget"
 	_ "github.com/tiny-systems/database-module/components/redisset"
+	_ "github.com/tiny-systems/database-module/components/vectorsearch"
+	_ "github.com/tiny-systems/database-module/components/vectorupsert"
 	"github.com/tiny-systems/module/cli"
 )
 
