@@ -11,7 +11,7 @@ require (
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/viper v1.20.1
 	github.com/swaggest/jsonschema-go v0.3.79
-	github.com/tiny-systems/module v0.11.2
+	github.com/tiny-systems/module v0.12.0
 )
 
 require (
