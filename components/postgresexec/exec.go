@@ -7,6 +7,7 @@ import (
 	"github.com/tiny-systems/database-module/components/pool"
 	"github.com/tiny-systems/module/api/v1alpha1"
 	"github.com/tiny-systems/module/module"
+	"github.com/tiny-systems/module/pkg/bundle"
 	"github.com/tiny-systems/module/registry"
 )
 
@@ -25,7 +26,7 @@ type Settings struct {
 
 type Request struct {
 	Context Context `json:"context,omitempty" configurable:"true" title:"Context"`
-	DSN     string  `json:"dsn" required:"true" minLength:"1" title:"DSN" description:"Postgres connection string (e.g. postgres://user:pass@host:port/db?sslmode=disable)"`
+	DSN     string  `json:"dsn" title:"DSN" description:"Postgres connection string. Leave empty to use the in-cluster pgvector bundle (auto-discovered); set it to target an external database."`
 	SQL     string  `json:"sql" required:"true" minLength:"1" title:"SQL" description:"INSERT/UPDATE/DELETE with $1, $2, ... placeholders" format:"textarea"`
 	Params  []any   `json:"params,omitempty" title:"Params" description:"Positional parameters for $1, $2, ..."`
 }
@@ -82,7 +83,18 @@ func (c *Component) Handle(ctx context.Context, handler module.Handler, port str
 }
 
 func (c *Component) run(ctx context.Context, handler module.Handler, in Request) module.Result {
-	p, err := pool.Postgres(ctx, in.DSN)
+	// Empty DSN = zero-config path: the in-cluster pgvector bundle
+	// (auto-discovered from env the operator chart injects). Lets a memory
+	// flow bootstrap its table with the same zero-config the vector
+	// components use, instead of forcing an explicit DSN just to CREATE TABLE.
+	dsn := in.DSN
+	if dsn == "" {
+		var derr error
+		if dsn, derr = bundle.PostgresDSN("pgvector"); derr != nil {
+			return c.fail(ctx, handler, in.Context, derr)
+		}
+	}
+	p, err := pool.Postgres(ctx, dsn)
 	if err != nil {
 		return c.fail(ctx, handler, in.Context, err)
 	}

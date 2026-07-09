@@ -8,6 +8,7 @@ import (
 	"github.com/tiny-systems/database-module/components/pool"
 	"github.com/tiny-systems/module/api/v1alpha1"
 	"github.com/tiny-systems/module/module"
+	"github.com/tiny-systems/module/pkg/bundle"
 	"github.com/tiny-systems/module/registry"
 )
 
@@ -38,7 +39,7 @@ type Settings struct {
 
 type Request struct {
 	Context Context `json:"context,omitempty" configurable:"true" title:"Context"`
-	DSN     string  `json:"dsn" required:"true" minLength:"1" title:"DSN" description:"Postgres connection string"`
+	DSN     string  `json:"dsn" title:"DSN" description:"Postgres connection string. Leave empty to use the in-cluster pgvector bundle (auto-discovered); set it to target an external database."`
 	SQL     string  `json:"sql" required:"true" minLength:"1" title:"SQL" description:"SELECT with $1, $2, ... placeholders" format:"textarea"`
 	Params  []any   `json:"params,omitempty" title:"Params"`
 }
@@ -96,7 +97,16 @@ func (c *Component) Handle(ctx context.Context, handler module.Handler, port str
 }
 
 func (c *Component) query(ctx context.Context, handler module.Handler, in Request) module.Result {
-	p, err := pool.Postgres(ctx, in.DSN)
+	// Empty DSN = zero-config path: the in-cluster pgvector bundle
+	// (auto-discovered), same as postgres_exec and the vector components.
+	dsn := in.DSN
+	if dsn == "" {
+		var derr error
+		if dsn, derr = bundle.PostgresDSN("pgvector"); derr != nil {
+			return c.fail(ctx, handler, in.Context, derr)
+		}
+	}
+	p, err := pool.Postgres(ctx, dsn)
 	if err != nil {
 		return c.fail(ctx, handler, in.Context, err)
 	}
