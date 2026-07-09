@@ -30,6 +30,7 @@ import (
 	"github.com/tiny-systems/database-module/components/pool"
 	"github.com/tiny-systems/module/api/v1alpha1"
 	"github.com/tiny-systems/module/module"
+	"github.com/tiny-systems/module/pkg/bundle"
 	"github.com/tiny-systems/module/registry"
 )
 
@@ -58,7 +59,7 @@ type Settings struct {
 
 type Request struct {
 	Context   Context        `json:"context,omitempty" configurable:"true" title:"Context"`
-	DSN       string         `json:"dsn" required:"true" minLength:"1" title:"DSN" description:"Postgres connection string. Per-call so flows can target multiple databases."`
+	DSN       string         `json:"dsn" title:"DSN" description:"Postgres connection string. Leave empty to use the in-cluster pgvector bundle (auto-discovered); set it to target an external database."`
 	Id        string         `json:"id" required:"true" minLength:"1" title:"Id" description:"Primary key. Existing rows with the same id are overwritten."`
 	Embedding []float32      `json:"embedding" required:"true" minItems:"1" title:"Embedding" description:"Dense vector — same length as the column dimension."`
 	Metadata  map[string]any `json:"metadata,omitempty" configurable:"true" title:"Metadata" description:"Optional JSONB payload (tags, source, timestamps, etc.). Ignored if Metadata Column is blank."`
@@ -138,7 +139,17 @@ func (c *Component) upsert(ctx context.Context, handler module.Handler, in Reque
 		}
 	}
 
-	p, err := pool.Postgres(ctx, in.DSN)
+	// Empty DSN = zero-config path: the in-cluster pgvector bundle the
+	// module declared (auto-discovered from env the operator chart
+	// injects when the bundle is enabled).
+	dsn := in.DSN
+	if dsn == "" {
+		var derr error
+		if dsn, derr = bundle.PostgresDSN("pgvector"); derr != nil {
+			return c.fail(ctx, handler, in.Context, derr)
+		}
+	}
+	p, err := pool.Postgres(ctx, dsn)
 	if err != nil {
 		return c.fail(ctx, handler, in.Context, err)
 	}

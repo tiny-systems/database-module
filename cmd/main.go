@@ -18,7 +18,29 @@ import (
 	_ "github.com/tiny-systems/database-module/components/vectorsearch"
 	_ "github.com/tiny-systems/database-module/components/vectorupsert"
 	"github.com/tiny-systems/module/cli"
+	"github.com/tiny-systems/module/module"
+	"github.com/tiny-systems/module/registry"
 )
+
+func init() {
+	// Declare the pgvector bundle so installing this module also
+	// provisions an in-cluster pgvector Postgres (the operator chart's
+	// curated subchart: pgvector/pgvector:pg16, extension pre-created
+	// via initdb, 8Gi PVC). vector_upsert / vector_search resolve it via
+	// bundle.PostgresDSN("pgvector") whenever their DSN is left empty —
+	// the RAG/memory store works with zero config; an explicit DSN still
+	// targets any external database.
+	registry.SetRequirements(module.Requirements{
+		Bundles: module.Bundles{
+			module.Bundle{
+				Name:           "pgvector",
+				Description:    "In-cluster Postgres with the pgvector extension (pgvector/pgvector:pg16, 8Gi PVC). Backs vector_upsert / vector_search when the DSN is left empty.",
+				DefaultEnabled: true,
+				ConnectionHint: "Auto-discovered — leave the component DSN empty. Explicit DSNs still work for external databases.",
+			},
+		},
+	})
+}
 
 var rootCmd = &cobra.Command{
 	Use:   "server",

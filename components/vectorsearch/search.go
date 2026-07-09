@@ -24,6 +24,7 @@ import (
 	"github.com/tiny-systems/database-module/components/pool"
 	"github.com/tiny-systems/module/api/v1alpha1"
 	"github.com/tiny-systems/module/module"
+	"github.com/tiny-systems/module/pkg/bundle"
 	"github.com/tiny-systems/module/registry"
 )
 
@@ -68,7 +69,7 @@ type Settings struct {
 
 type Request struct {
 	Context        Context        `json:"context,omitempty" configurable:"true" title:"Context"`
-	DSN            string         `json:"dsn" required:"true" minLength:"1" title:"DSN"`
+	DSN            string         `json:"dsn" title:"DSN" description:"Postgres connection string. Leave empty to use the in-cluster pgvector bundle (auto-discovered); set it to target an external database."`
 	Embedding      []float32      `json:"embedding" required:"true" minItems:"1" title:"Query Embedding" description:"Vector to search by — typically the embedding of the user's question."`
 	TopK           int            `json:"topK" minimum:"1" default:"5" title:"Top K" description:"Maximum rows to return."`
 	MetadataFilter map[string]any `json:"metadataFilter,omitempty" configurable:"true" title:"Metadata Filter" description:"Optional JSONB containment filter — only rows where metadata @> filter are returned. Empty means no filter."`
@@ -166,7 +167,16 @@ func (c *Component) search(ctx context.Context, handler module.Handler, in Reque
 		return c.fail(ctx, handler, in.Context, err)
 	}
 
-	p, err := pool.Postgres(ctx, in.DSN)
+	// Empty DSN = zero-config path: the in-cluster pgvector bundle
+	// (auto-discovered from env the operator chart injects).
+	dsn := in.DSN
+	if dsn == "" {
+		var derr error
+		if dsn, derr = bundle.PostgresDSN("pgvector"); derr != nil {
+			return c.fail(ctx, handler, in.Context, derr)
+		}
+	}
+	p, err := pool.Postgres(ctx, dsn)
 	if err != nil {
 		return c.fail(ctx, handler, in.Context, err)
 	}
