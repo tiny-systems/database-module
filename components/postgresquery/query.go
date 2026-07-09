@@ -56,6 +56,7 @@ type Error struct {
 }
 
 type Component struct {
+	module.Base
 	settings Settings
 }
 
@@ -100,13 +101,19 @@ func (c *Component) query(ctx context.Context, handler module.Handler, in Reques
 	// Empty DSN = zero-config path: the in-cluster pgvector bundle
 	// (auto-discovered), same as postgres_exec and the vector components.
 	dsn := in.DSN
+	schema := ""
 	if dsn == "" {
 		var derr error
 		if dsn, derr = bundle.PostgresDSN("pgvector"); derr != nil {
 			return c.fail(ctx, handler, in.Context, derr)
 		}
+		// Isolate the shared bundle per project: SELECT only sees this
+		// node's identity-derived schema, closing the raw-SQL read path that
+		// a metadata-tag filter would leave open. No-op for an external DSN.
+		id := c.Identity()
+		schema = pool.TenantSchema(id.Namespace, id.ProjectName)
 	}
-	p, err := pool.Postgres(ctx, dsn)
+	p, err := pool.PostgresScoped(ctx, dsn, schema)
 	if err != nil {
 		return c.fail(ctx, handler, in.Context, err)
 	}

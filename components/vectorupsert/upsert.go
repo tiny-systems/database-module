@@ -77,6 +77,7 @@ type Error struct {
 }
 
 type Component struct {
+	module.Base
 	settings Settings
 }
 
@@ -143,13 +144,19 @@ func (c *Component) upsert(ctx context.Context, handler module.Handler, in Reque
 	// module declared (auto-discovered from env the operator chart
 	// injects when the bundle is enabled).
 	dsn := in.DSN
+	schema := ""
 	if dsn == "" {
 		var derr error
 		if dsn, derr = bundle.PostgresDSN("pgvector"); derr != nil {
 			return c.fail(ctx, handler, in.Context, derr)
 		}
+		// Isolate the shared bundle per project: all SQL is confined to a
+		// schema derived from this node's injected identity (not settable
+		// by the flow author). No-op for an explicit external DSN.
+		id := c.Identity()
+		schema = pool.TenantSchema(id.Namespace, id.ProjectName)
 	}
-	p, err := pool.Postgres(ctx, dsn)
+	p, err := pool.PostgresScoped(ctx, dsn, schema)
 	if err != nil {
 		return c.fail(ctx, handler, in.Context, err)
 	}
