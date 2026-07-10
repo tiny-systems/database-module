@@ -113,7 +113,7 @@ func (c *Component) GetInfo() module.ComponentInfo {
 	return module.ComponentInfo{
 		Name:        ComponentName,
 		Description: "Vector Search",
-		Info:        "kNN over a pgvector column. Returns the top-K nearest rows by configurable distance metric, with a normalised score in [0,1]. Optional JSONB metadata filter restricts the search. Pair with vector_upsert to build a RAG store.",
+		Info:        "kNN over a pgvector column. Returns the top-K nearest rows by configurable distance metric, with a normalised score in [0,1]. Optional JSONB metadata filter restricts the search. Pair with vector_upsert to build a RAG store — on the zero-config bundle a query before anything is stored returns an empty result (not an error), so the question path answers gracefully on an empty memory.",
 		Tags:        []string{"Vectors", "Postgres", "pgvector", "RAG", "DB", "kNN"},
 	}
 }
@@ -213,6 +213,13 @@ func (c *Component) search(ctx context.Context, handler module.Handler, in Reque
 
 	rows, err := p.Query(ctx, sql, args...)
 	if err != nil {
+		// Zero-config store queried before anything was written — the table
+		// vector_upsert would create doesn't exist yet. That's "no memories",
+		// not a failure: return an empty result so the question path answers
+		// gracefully instead of erroring the whole flow.
+		if in.DSN == "" && isUndefinedTable(err) {
+			return handler(ctx, ResponsePort, Response{Context: in.Context, Results: []Result{}, Count: 0})
+		}
 		return c.fail(ctx, handler, in.Context, err)
 	}
 	defer rows.Close()
@@ -333,6 +340,12 @@ func validateIdentifier(label, ident string) error {
 		return fmt.Errorf("invalid %s %q: must match [a-zA-Z_][a-zA-Z0-9_]* (optionally schema-qualified)", label, ident)
 	}
 	return nil
+}
+
+// isUndefinedTable reports whether a query error is Postgres "undefined
+// table" (SQLSTATE 42P01) — i.e. the store table doesn't exist yet.
+func isUndefinedTable(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "42P01")
 }
 
 func defaultStr(v, fallback string) string {

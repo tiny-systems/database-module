@@ -4,29 +4,32 @@
 // (embed → vector_upsert; later, query embed → vector_search →
 // llm_chat).
 //
-// The component does NOT manage schema. The caller is responsible for
-// creating the table and the `CREATE EXTENSION vector;`. The expected
-// shape is:
+// Zero-config by default: on the in-cluster pgvector bundle path (empty
+// DSN) the component CREATES the table on first write if it does not
+// exist — `id TEXT PRIMARY KEY, embedding VECTOR(<dims>)[, metadata JSONB]`,
+// the dimension inferred from the embedding it was handed. So an
+// `embed_text → vector_upsert` flow just works with no separate DDL step.
+// For an EXPLICIT external DSN the component does NOT touch schema — the
+// caller owns that database, so the table (and `CREATE EXTENSION vector;`)
+// must already exist. Column names are configurable so an existing schema
+// can be reused; the metadata column is optional (blank setting skips it).
 //
-//	CREATE TABLE memories (
-//	  id        TEXT  PRIMARY KEY,
-//	  embedding VECTOR(384),
-//	  metadata  JSONB
-//	);
-//
-// Column names are configurable via settings so existing schemas can
-// be reused. The metadata column is optional — leave the setting blank
-// to skip it entirely.
+// The id is likewise optional: leave it empty and the component mints a
+// random one, so the common case (embed → store) needs no id-generating
+// node in between.
 package vectorupsert
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"regexp"
 	"strconv"
 	"strings"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/tiny-systems/database-module/components/pool"
 	"github.com/tiny-systems/module/api/v1alpha1"
 	"github.com/tiny-systems/module/module"
@@ -60,7 +63,7 @@ type Settings struct {
 type Request struct {
 	Context   Context        `json:"context,omitempty" configurable:"true" title:"Context"`
 	DSN       string         `json:"dsn" title:"DSN" description:"Postgres connection string. Leave empty to use the in-cluster pgvector bundle (auto-discovered); set it to target an external database."`
-	Id        string         `json:"id" required:"true" minLength:"1" title:"Id" description:"Primary key. Existing rows with the same id are overwritten."`
+	Id        string         `json:"id" title:"Id" description:"Primary key. Leave empty to auto-generate a random id. Existing rows with the same id are overwritten."`
 	Embedding []float32      `json:"embedding" required:"true" minItems:"1" title:"Embedding" description:"Dense vector — same length as the column dimension."`
 	Metadata  map[string]any `json:"metadata,omitempty" configurable:"true" title:"Metadata" description:"Optional JSONB payload (tags, source, timestamps, etc.). Ignored if Metadata Column is blank."`
 }
@@ -95,7 +98,7 @@ func (c *Component) GetInfo() module.ComponentInfo {
 	return module.ComponentInfo{
 		Name:        ComponentName,
 		Description: "Vector Upsert",
-		Info:        "Writes an embedding row into a pgvector table. INSERT ... ON CONFLICT (id) DO UPDATE — existing rows are overwritten. The table, id column, embedding column, and optional metadata column are configurable; the embedding extension must be installed and the table must already exist.",
+		Info:        "Writes an embedding row into a pgvector table. INSERT ... ON CONFLICT (id) DO UPDATE — existing rows are overwritten. Zero-config on the in-cluster bundle: leave DSN empty and the table is created automatically on first write (vector dimension inferred from the embedding), and an empty id is auto-generated — so wire embed_text.embedding straight into this node's embedding with NO id-generating node in between. Only an explicit external DSN requires you to pre-create the table.",
 		Tags:        []string{"Vectors", "Postgres", "pgvector", "RAG", "DB"},
 	}
 }
@@ -161,6 +164,25 @@ func (c *Component) upsert(ctx context.Context, handler module.Handler, in Reque
 		return c.fail(ctx, handler, in.Context, err)
 	}
 
+	// Zero-config store: create the table on first write when running
+	// against the in-cluster bundle. The embedding we were handed fixes the
+	// vector dimension, so we never guess. Skipped for an explicit external
+	// DSN — that database's schema belongs to the caller. len==0 is left to
+	// fall through so the INSERT surfaces the real "empty embedding" error
+	// rather than a CREATE with vector(0).
+	if in.DSN == "" && len(in.Embedding) > 0 {
+		if err := ensureVectorTable(ctx, p, c.settings.Table, idCol, embCol, metaCol, len(in.Embedding)); err != nil {
+			return c.fail(ctx, handler, in.Context, err)
+		}
+	}
+
+	// Auto-generate an id when the caller left it empty, so an embed→store
+	// flow needs no id-minting node in between.
+	id := in.Id
+	if id == "" {
+		id = newID()
+	}
+
 	vec := formatVector(in.Embedding)
 
 	var sql string
@@ -173,7 +195,7 @@ func (c *Component) upsert(ctx context.Context, handler module.Handler, in Reque
 			c.settings.Table, idCol, embCol,
 			idCol, embCol, embCol,
 		)
-		args = []any{in.Id, vec}
+		args = []any{id, vec}
 	} else {
 		metaBytes, err := json.Marshal(in.Metadata)
 		if err != nil {
@@ -185,7 +207,7 @@ func (c *Component) upsert(ctx context.Context, handler module.Handler, in Reque
 			c.settings.Table, idCol, embCol, metaCol,
 			idCol, embCol, embCol, metaCol, metaCol,
 		)
-		args = []any{in.Id, vec, string(metaBytes)}
+		args = []any{id, vec, string(metaBytes)}
 	}
 
 	tag, err := p.Exec(ctx, sql, args...)
@@ -195,7 +217,7 @@ func (c *Component) upsert(ctx context.Context, handler module.Handler, in Reque
 
 	return handler(ctx, ResponsePort, Response{
 		Context:      in.Context,
-		Id:           in.Id,
+		Id:           id,
 		RowsAffected: tag.RowsAffected(),
 	})
 }
@@ -219,6 +241,33 @@ func (c *Component) Ports() []module.Port {
 	return append(ports, module.Port{
 		Name: ErrorPort, Label: "Error", Source: true, Configuration: Error{}, Position: module.Bottom,
 	})
+}
+
+// ensureVectorTable creates the target table if it doesn't exist, using the
+// embedding length as the vector dimension. Idempotent (IF NOT EXISTS), so
+// it's a no-op after the first write. Only called on the zero-config bundle
+// path; identifiers are already validated by the caller. CREATE EXTENSION is
+// best-effort — the bundle image ships pgvector installed, but requesting it
+// IF NOT EXISTS costs nothing and makes a bare Postgres work too.
+func ensureVectorTable(ctx context.Context, p *pgxpool.Pool, table, idCol, embCol, metaCol string, dims int) error {
+	_, _ = p.Exec(ctx, "CREATE EXTENSION IF NOT EXISTS vector")
+	cols := fmt.Sprintf("%s TEXT PRIMARY KEY, %s vector(%d)", idCol, embCol, dims)
+	if metaCol != "" {
+		cols += fmt.Sprintf(", %s jsonb", metaCol)
+	}
+	_, err := p.Exec(ctx, fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (%s)", table, cols))
+	return err
+}
+
+// newID mints a random 128-bit hex id for callers that don't supply one.
+func newID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// rand.Read effectively never fails; degrade to a constant-prefixed
+		// value rather than an empty primary key if it somehow does.
+		return "mem-" + hex.EncodeToString(b[:8])
+	}
+	return hex.EncodeToString(b[:])
 }
 
 // formatVector renders []float32 as pgvector's text input format:
