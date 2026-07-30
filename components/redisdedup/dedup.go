@@ -38,11 +38,6 @@ type Result struct {
 	ID      string  `json:"id" title:"ID"`
 }
 
-type Error struct {
-	Context Context `json:"context,omitempty" configurable:"true" title:"Context"`
-	Error   string  `json:"error" title:"Error"`
-}
-
 type Component struct {
 	settings Settings
 }
@@ -104,11 +99,17 @@ func (c *Component) dedup(ctx context.Context, handler module.Handler, in Reques
 	return handler(ctx, SeenPort, Result{Context: in.Context, ID: in.ID})
 }
 
+// fail hands the failure to the error port, or bubbles it when the port is off.
+// Nothing here is ever marked retryable, transient causes included: SET NX is
+// the whole dedup decision, and a failure leaves it unknown whether the key
+// landed. A second attempt that trips over its own key routes a genuinely new
+// ID to Seen — silently dropping it — so this is one call that must be answered
+// by the flow author, not by a blind re-run.
 func (c *Component) fail(ctx context.Context, handler module.Handler, reqCtx Context, err error) module.Result {
 	if !c.settings.EnableErrorPort {
 		return module.Fail(err)
 	}
-	return handler(ctx, ErrorPort, Error{Context: reqCtx, Error: err.Error()})
+	return handler(ctx, ErrorPort, module.NewError(reqCtx, err))
 }
 
 func (c *Component) Ports() []module.Port {
@@ -122,7 +123,7 @@ func (c *Component) Ports() []module.Port {
 		return ports
 	}
 	return append(ports, module.Port{
-		Name: ErrorPort, Label: "Error", Source: true, Configuration: Error{}, Position: module.Bottom,
+		Name: ErrorPort, Label: "Error", Source: true, Configuration: module.ErrorMessage{}, Position: module.Bottom,
 	})
 }
 

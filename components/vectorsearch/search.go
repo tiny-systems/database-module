@@ -88,11 +88,6 @@ type Response struct {
 	Count   int      `json:"count" title:"Count"`
 }
 
-type Error struct {
-	Context Context `json:"context,omitempty" configurable:"true" title:"Context"`
-	Error   string  `json:"error" title:"Error"`
-}
-
 type Component struct {
 	module.Base
 	settings Settings
@@ -220,7 +215,7 @@ func (c *Component) search(ctx context.Context, handler module.Handler, in Reque
 		if in.DSN == "" && isUndefinedTable(err) {
 			return handler(ctx, ResponsePort, Response{Context: in.Context, Results: []Result{}, Count: 0})
 		}
-		return c.fail(ctx, handler, in.Context, err)
+		return c.fail(ctx, handler, in.Context, c.retryable(err))
 	}
 	defer rows.Close()
 
@@ -236,7 +231,7 @@ func (c *Component) search(ctx context.Context, handler module.Handler, in Reque
 		}
 
 		if err := rows.Scan(dest...); err != nil {
-			return c.fail(ctx, handler, in.Context, err)
+			return c.fail(ctx, handler, in.Context, c.retryable(err))
 		}
 
 		var meta Metadata
@@ -254,7 +249,7 @@ func (c *Component) search(ctx context.Context, handler module.Handler, in Reque
 		})
 	}
 	if err := rows.Err(); err != nil {
-		return c.fail(ctx, handler, in.Context, err)
+		return c.fail(ctx, handler, in.Context, c.retryable(err))
 	}
 
 	return handler(ctx, ResponsePort, Response{
@@ -264,11 +259,25 @@ func (c *Component) search(ctx context.Context, handler module.Handler, in Reque
 	})
 }
 
+// retryable marks a failure the server or the network could recover from. kNN
+// is a pure read, so re-running the whole handler cannot double-apply anything
+// — unlike vector_upsert, which never marks. A SQL error (dimension mismatch,
+// unknown column) is left alone; the same query reproduces it. Only the query
+// path calls this: the identifier and metric checks above go straight to fail,
+// since bad config is not something a backoff clears.
+func (c *Component) retryable(err error) error {
+	if pool.IsTransientPostgres(err) {
+		return module.Retryable(err)
+	}
+	return err
+}
+
 func (c *Component) fail(ctx context.Context, handler module.Handler, reqCtx Context, err error) module.Result {
 	if !c.settings.EnableErrorPort {
+		// Bubble unchanged so retryability marked at the call site survives.
 		return module.Fail(err)
 	}
-	return handler(ctx, ErrorPort, Error{Context: reqCtx, Error: err.Error()})
+	return handler(ctx, ErrorPort, module.NewError(reqCtx, err))
 }
 
 func (c *Component) Ports() []module.Port {
@@ -288,7 +297,7 @@ func (c *Component) Ports() []module.Port {
 		return ports
 	}
 	return append(ports, module.Port{
-		Name: ErrorPort, Label: "Error", Source: true, Configuration: Error{}, Position: module.Bottom,
+		Name: ErrorPort, Label: "Error", Source: true, Configuration: module.ErrorMessage{}, Position: module.Bottom,
 	})
 }
 

@@ -7,10 +7,13 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 )
@@ -105,4 +108,52 @@ func Redis(url string) (*redis.Client, error) {
 		return actual.(*redis.Client), nil
 	}
 	return c, nil
+}
+
+// IsTransientPostgres reports whether a Postgres failure is one a backoff retry
+// could clear. Only meaningful for a caller whose statement is safe to re-run —
+// it answers "could this succeed later", never "is re-running it safe".
+//
+// A SQLSTATE reply means the server received and rejected the statement, so the
+// same statement gets the same rejection — except for the classes that describe
+// the server's condition rather than the query: connection exception (08),
+// insufficient resources (53), shutting down or not yet accepting connections
+// (57P01-03), and a serialization/deadlock abort (40001, 40P01), which is
+// exactly what a caller is told to retry. Anything that is not a server reply
+// at all — dial failure, dropped socket, pool acquire timeout — means the
+// statement never ran.
+func IsTransientPostgres(err error) bool {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		switch {
+		case strings.HasPrefix(pgErr.Code, "08"), strings.HasPrefix(pgErr.Code, "53"),
+			pgErr.Code == "57P01", pgErr.Code == "57P02", pgErr.Code == "57P03",
+			pgErr.Code == "40001", pgErr.Code == "40P01":
+			return true
+		}
+		return false
+	}
+	return true
+}
+
+// IsTransientRedis is IsTransientPostgres for Redis: same contract, same
+// "could this succeed later, not is it safe to repeat" caveat.
+//
+// A redis.Error is a server reply — WRONGTYPE, NOAUTH, a malformed argument —
+// which the same command reproduces forever. The exceptions are the replies
+// that mean "not right now": LOADING while a replica reads its dataset,
+// TRYAGAIN / CLUSTERDOWN / MASTERDOWN during a cluster reshard or failover.
+// Everything else reaching us is transport (dial refused, i/o timeout).
+func IsTransientRedis(err error) bool {
+	var rErr redis.Error
+	if errors.As(err, &rErr) {
+		msg := rErr.Error()
+		for _, prefix := range []string{"LOADING", "TRYAGAIN", "CLUSTERDOWN", "MASTERDOWN"} {
+			if strings.HasPrefix(msg, prefix) {
+				return true
+			}
+		}
+		return false
+	}
+	return true
 }

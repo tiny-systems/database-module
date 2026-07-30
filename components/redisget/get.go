@@ -37,11 +37,6 @@ type Response struct {
 	Value   string  `json:"value" title:"Value" description:"Empty when key does not exist"`
 }
 
-type Error struct {
-	Context Context `json:"context,omitempty" configurable:"true" title:"Context"`
-	Error   string  `json:"error" title:"Error"`
-}
-
 type Component struct {
 	settings Settings
 }
@@ -94,6 +89,11 @@ func (c *Component) get(ctx context.Context, handler module.Handler, in Request)
 		return handler(ctx, ResponsePort, Response{Context: in.Context, Found: false})
 	}
 	if err != nil {
+		// A GET changes nothing, so re-running the whole handler is free —
+		// mark whatever the server or the socket could recover from.
+		if pool.IsTransientRedis(err) {
+			err = module.Retryable(err)
+		}
 		return c.fail(ctx, handler, in.Context, err)
 	}
 	return handler(ctx, ResponsePort, Response{Context: in.Context, Found: true, Value: val})
@@ -101,9 +101,10 @@ func (c *Component) get(ctx context.Context, handler module.Handler, in Request)
 
 func (c *Component) fail(ctx context.Context, handler module.Handler, reqCtx Context, err error) module.Result {
 	if !c.settings.EnableErrorPort {
+		// Bubble unchanged so retryability marked at the call site survives.
 		return module.Fail(err)
 	}
-	return handler(ctx, ErrorPort, Error{Context: reqCtx, Error: err.Error()})
+	return handler(ctx, ErrorPort, module.NewError(reqCtx, err))
 }
 
 func (c *Component) Ports() []module.Port {
@@ -116,7 +117,7 @@ func (c *Component) Ports() []module.Port {
 		return ports
 	}
 	return append(ports, module.Port{
-		Name: ErrorPort, Label: "Error", Source: true, Configuration: Error{}, Position: module.Bottom,
+		Name: ErrorPort, Label: "Error", Source: true, Configuration: module.ErrorMessage{}, Position: module.Bottom,
 	})
 }
 

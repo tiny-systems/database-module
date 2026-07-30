@@ -50,11 +50,6 @@ type Response struct {
 	Count   int     `json:"count" title:"Count"`
 }
 
-type Error struct {
-	Context Context `json:"context,omitempty" configurable:"true" title:"Context"`
-	Error   string  `json:"error" title:"Error"`
-}
-
 type Component struct {
 	module.Base
 	settings Settings
@@ -120,7 +115,7 @@ func (c *Component) query(ctx context.Context, handler module.Handler, in Reques
 
 	rows, err := p.Query(ctx, in.SQL, in.Params...)
 	if err != nil {
-		return c.fail(ctx, handler, in.Context, err)
+		return c.fail(ctx, handler, in.Context, c.retryable(err))
 	}
 	defer rows.Close()
 
@@ -130,7 +125,7 @@ func (c *Component) query(ctx context.Context, handler module.Handler, in Reques
 	for rows.Next() {
 		values, err := rows.Values()
 		if err != nil {
-			return c.fail(ctx, handler, in.Context, err)
+			return c.fail(ctx, handler, in.Context, c.retryable(err))
 		}
 		row := make(Row, len(cols))
 		for i, col := range cols {
@@ -139,7 +134,7 @@ func (c *Component) query(ctx context.Context, handler module.Handler, in Reques
 		out = append(out, row)
 	}
 	if err := rows.Err(); err != nil {
-		return c.fail(ctx, handler, in.Context, err)
+		return c.fail(ctx, handler, in.Context, c.retryable(err))
 	}
 
 	return handler(ctx, ResponsePort, Response{
@@ -149,11 +144,24 @@ func (c *Component) query(ctx context.Context, handler module.Handler, in Reques
 	})
 }
 
+// retryable marks a SELECT failure the server or the network could recover
+// from. Safe here in a way it isn't for postgres_exec: this component only
+// reads, so re-running the whole handler cannot double-apply anything. A SQL
+// error (bad syntax, unknown column, permission denied) is left alone — the
+// same statement would just fail again.
+func (c *Component) retryable(err error) error {
+	if pool.IsTransientPostgres(err) {
+		return module.Retryable(err)
+	}
+	return err
+}
+
 func (c *Component) fail(ctx context.Context, handler module.Handler, reqCtx Context, err error) module.Result {
 	if !c.settings.EnableErrorPort {
+		// Bubble unchanged so retryability marked at the call site survives.
 		return module.Fail(err)
 	}
-	return handler(ctx, ErrorPort, Error{Context: reqCtx, Error: err.Error()})
+	return handler(ctx, ErrorPort, module.NewError(reqCtx, err))
 }
 
 func (c *Component) Ports() []module.Port {
@@ -174,7 +182,7 @@ func (c *Component) Ports() []module.Port {
 		return ports
 	}
 	return append(ports, module.Port{
-		Name: ErrorPort, Label: "Error", Source: true, Configuration: Error{}, Position: module.Bottom,
+		Name: ErrorPort, Label: "Error", Source: true, Configuration: module.ErrorMessage{}, Position: module.Bottom,
 	})
 }
 

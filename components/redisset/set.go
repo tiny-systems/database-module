@@ -40,11 +40,6 @@ type Response struct {
 	Created bool    `json:"created" title:"Created" description:"true if the value was set; false if NX prevented the set"`
 }
 
-type Error struct {
-	Context Context `json:"context,omitempty" configurable:"true" title:"Context"`
-	Error   string  `json:"error" title:"Error"`
-}
-
 type Component struct {
 	settings Settings
 }
@@ -98,12 +93,21 @@ func (c *Component) set(ctx context.Context, handler module.Handler, in Request)
 	if in.NX {
 		ok, err := client.SetNX(ctx, in.Key, in.Value, ttl).Result()
 		if err != nil {
+			// Deliberately not retryable: SET NX is a first-seen test, and a
+			// failure gives no answer on whether the key landed. A retry that
+			// finds its own write reports created=false, telling the caller
+			// something else owns the key when nothing else does.
 			return c.fail(ctx, handler, in.Context, err)
 		}
 		created = ok
 	} else {
 		_, err := client.Set(ctx, in.Key, in.Value, ttl).Result()
 		if err != nil && !errors.Is(err, redis.Nil) {
+			// A plain SET writes a fixed key and value, so re-running the
+			// handler lands the same state — safe to hand to a retry.
+			if pool.IsTransientRedis(err) {
+				err = module.Retryable(err)
+			}
 			return c.fail(ctx, handler, in.Context, err)
 		}
 	}
@@ -113,9 +117,10 @@ func (c *Component) set(ctx context.Context, handler module.Handler, in Request)
 
 func (c *Component) fail(ctx context.Context, handler module.Handler, reqCtx Context, err error) module.Result {
 	if !c.settings.EnableErrorPort {
+		// Bubble unchanged so retryability marked at the call site survives.
 		return module.Fail(err)
 	}
-	return handler(ctx, ErrorPort, Error{Context: reqCtx, Error: err.Error()})
+	return handler(ctx, ErrorPort, module.NewError(reqCtx, err))
 }
 
 func (c *Component) Ports() []module.Port {
@@ -128,7 +133,7 @@ func (c *Component) Ports() []module.Port {
 		return ports
 	}
 	return append(ports, module.Port{
-		Name: ErrorPort, Label: "Error", Source: true, Configuration: Error{}, Position: module.Bottom,
+		Name: ErrorPort, Label: "Error", Source: true, Configuration: module.ErrorMessage{}, Position: module.Bottom,
 	})
 }
 
