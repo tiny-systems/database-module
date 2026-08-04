@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"sync"
 
@@ -134,6 +135,29 @@ func IsTransientPostgres(err error) bool {
 		return false
 	}
 	return true
+}
+
+// IsNeverSentPostgres reports whether the failure provably happened before the
+// statement could have reached the server: the connection attempt itself
+// failed (pgconn.ConnectError), or pgx guarantees the query bytes were never
+// written (pgconn.SafeToRetry). Unlike IsTransientPostgres, this answers "is
+// re-running it safe" too — nothing was sent, so nothing can have applied —
+// which is what lets even a non-idempotent write component mark it.
+func IsNeverSentPostgres(err error) bool {
+	var connectErr *pgconn.ConnectError
+	if errors.As(err, &connectErr) {
+		return true
+	}
+	return pgconn.SafeToRetry(err)
+}
+
+// IsNeverSentRedis is IsNeverSentPostgres for Redis: true only when the dial
+// itself failed, so the command never reached the server and a retry cannot
+// double-apply. Anything past a successful dial (i/o timeout mid-command,
+// dropped socket) leaves a write's outcome unknown and is not covered here.
+func IsNeverSentRedis(err error) bool {
+	var opErr *net.OpError
+	return errors.As(err, &opErr) && opErr.Op == "dial"
 }
 
 // IsTransientRedis is IsTransientPostgres for Redis: same contract, same

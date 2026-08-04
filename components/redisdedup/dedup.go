@@ -90,6 +90,12 @@ func (c *Component) dedup(ctx context.Context, handler module.Handler, in Reques
 
 	created, err := client.SetNX(ctx, key, "1", ttl).Result()
 	if err != nil {
+		// A dial failure means the command never reached the server, so no
+		// key can have landed — the one case fail's "unknown whether it
+		// landed" reasoning does not apply to.
+		if pool.IsNeverSentRedis(err) {
+			err = module.Retryable(err)
+		}
 		return c.fail(ctx, handler, in.Context, err)
 	}
 
@@ -100,11 +106,13 @@ func (c *Component) dedup(ctx context.Context, handler module.Handler, in Reques
 }
 
 // fail hands the failure to the error port, or bubbles it when the port is off.
-// Nothing here is ever marked retryable, transient causes included: SET NX is
-// the whole dedup decision, and a failure leaves it unknown whether the key
-// landed. A second attempt that trips over its own key routes a genuinely new
-// ID to Seen — silently dropping it — so this is one call that must be answered
-// by the flow author, not by a blind re-run.
+// Nothing past a successful dial is ever marked retryable, transient causes
+// included: SET NX is the whole dedup decision, and a failure leaves it unknown
+// whether the key landed. A second attempt that trips over its own key routes a
+// genuinely new ID to Seen — silently dropping it — so this is one call that
+// must be answered by the flow author, not by a blind re-run. The dial failure
+// marked at the call site is the exception: the command never reached the
+// server, so no key can have landed.
 func (c *Component) fail(ctx context.Context, handler module.Handler, reqCtx Context, err error) module.Result {
 	if !c.settings.EnableErrorPort {
 		return module.Fail(err)

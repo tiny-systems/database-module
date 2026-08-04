@@ -167,6 +167,13 @@ func (c *Component) upsert(ctx context.Context, handler module.Handler, in Reque
 	// rather than a CREATE with vector(0).
 	if in.DSN == "" && len(in.Embedding) > 0 {
 		if err := ensureVectorTable(ctx, p, c.settings.Table, idCol, embCol, metaCol, len(in.Embedding)); err != nil {
+			// Safe to mark transient failures here, unlike the INSERT below:
+			// the row hasn't been written yet and everything up to this point
+			// (pool acquire, CREATE ... IF NOT EXISTS) is idempotent, so
+			// re-running the whole handler cannot duplicate anything.
+			if pool.IsTransientPostgres(err) {
+				err = module.Retryable(err)
+			}
 			return c.fail(ctx, handler, in.Context, err)
 		}
 	}
@@ -207,6 +214,11 @@ func (c *Component) upsert(ctx context.Context, handler module.Handler, in Reque
 
 	tag, err := p.Exec(ctx, sql, args...)
 	if err != nil {
+		// Only a provably-never-sent failure (dial refused, query bytes never
+		// written) is marked — see fail's comment for why nothing else is.
+		if pool.IsNeverSentPostgres(err) {
+			err = module.Retryable(err)
+		}
 		return c.fail(ctx, handler, in.Context, err)
 	}
 
@@ -218,12 +230,14 @@ func (c *Component) upsert(ctx context.Context, handler module.Handler, in Reque
 }
 
 // fail hands the failure to the error port, or bubbles it when the port is off.
-// Nothing here is ever marked retryable, transient causes included. The upsert
-// looks idempotent — ON CONFLICT (id) DO UPDATE — but only when the caller
-// supplies the id: an empty id is minted fresh per invocation, so re-running the
-// handler writes a SECOND row for the same text instead of overwriting the
-// first, quietly duplicating a memory. And a write that fails on the way back
-// (connection dropped after commit) has still landed.
+// The INSERT is almost never marked retryable, transient causes included. The
+// upsert looks idempotent — ON CONFLICT (id) DO UPDATE — but only when the
+// caller supplies the id: an empty id is minted fresh per invocation, so
+// re-running the handler writes a SECOND row for the same text instead of
+// overwriting the first, quietly duplicating a memory. And a write that fails
+// on the way back (connection dropped after commit) has still landed. The call
+// sites mark the two provably-safe cases: a failure before the INSERT was sent
+// (pool.IsNeverSentPostgres), and the idempotent table-ensure step.
 func (c *Component) fail(ctx context.Context, handler module.Handler, reqCtx Context, err error) module.Result {
 	if !c.settings.EnableErrorPort {
 		return module.Fail(err)

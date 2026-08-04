@@ -93,10 +93,15 @@ func (c *Component) set(ctx context.Context, handler module.Handler, in Request)
 	if in.NX {
 		ok, err := client.SetNX(ctx, in.Key, in.Value, ttl).Result()
 		if err != nil {
-			// Deliberately not retryable: SET NX is a first-seen test, and a
-			// failure gives no answer on whether the key landed. A retry that
-			// finds its own write reports created=false, telling the caller
-			// something else owns the key when nothing else does.
+			// Deliberately not retryable past the dial: SET NX is a first-seen
+			// test, and a failure gives no answer on whether the key landed. A
+			// retry that finds its own write reports created=false, telling
+			// the caller something else owns the key when nothing else does.
+			// A dial failure is the exception — the command never reached the
+			// server, so no key can have landed.
+			if pool.IsNeverSentRedis(err) {
+				err = module.Retryable(err)
+			}
 			return c.fail(ctx, handler, in.Context, err)
 		}
 		created = ok

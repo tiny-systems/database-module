@@ -104,6 +104,11 @@ func (c *Component) run(ctx context.Context, handler module.Handler, in Request)
 
 	tag, err := p.Exec(ctx, in.SQL, in.Params...)
 	if err != nil {
+		// Only a provably-never-sent failure (dial refused, query bytes never
+		// written) is marked — see fail's comment for why nothing else is.
+		if pool.IsNeverSentPostgres(err) {
+			err = module.Retryable(err)
+		}
 		return c.fail(ctx, handler, in.Context, err)
 	}
 
@@ -114,11 +119,13 @@ func (c *Component) run(ctx context.Context, handler module.Handler, in Request)
 }
 
 // fail hands the failure to the error port, or bubbles it when the port is off.
-// Nothing here is ever marked retryable, transient causes included: this runs
+// Almost nothing here is marked retryable, transient causes included: this runs
 // arbitrary INSERT/UPDATE/DELETE, and a statement that fails on the way back
 // (connection dropped after commit) has still applied. Re-running the handler
-// would insert twice. A caller who knows their SQL is idempotent can retry it
-// deliberately; the component cannot know that for them.
+// would insert twice. The one exception, marked at the call site, is a failure
+// that provably precedes the send (pool.IsNeverSentPostgres) — nothing ran, so
+// nothing can have applied. A caller who knows their SQL is idempotent can
+// retry the rest deliberately; the component cannot know that for them.
 func (c *Component) fail(ctx context.Context, handler module.Handler, reqCtx Context, err error) module.Result {
 	if !c.settings.EnableErrorPort {
 		return module.Fail(err)
